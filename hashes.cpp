@@ -2,12 +2,13 @@
 #include <cassert>
 #include <chrono>
 #include <cstdint>
-#include <iomanip>
 #include <iostream>
 #include <map>
 #include <random>
 #include <utility>
 #include <vector>
+
+#include "BBHash/BooPHF.h"
 
 #define RND_SEED 42
 
@@ -44,7 +45,8 @@ public:
 
   size_t size() const { return m_data.size(); }
 
-  const std::vector<key_t> &keys() const;
+  const std::vector<key_t> &keys() const { return m_keys; }
+  const std::vector<key_value_t> &key_vals() const { return m_data; }
 
   std::vector<key_t> make_task(size_t n_iters) {
     std::vector<key_t> task;
@@ -83,35 +85,92 @@ value_t get_val_binsearch(key_t key, const key_value_t *data,
   return data[right].first == key ? data[right].second : data[left].second;
 }
 
+typedef boomphf::SingleHashFunctor<uint64_t> hasher_t;
+typedef boomphf::mphf<uint64_t, hasher_t> boophf_t;
+
+class BBHashMap final {
+public:
+  BBHashMap(size_t N, const BenchSet &bench, double gamma)
+      : m_bphf(N, boomphf::range(bench.keys().begin(), bench.keys().end()), 1,
+               gamma) {
+    m_vals.resize(N);
+    for (key_value_t key_val : bench.key_vals()) {
+      size_t idx = m_bphf.lookup(key_val.first);
+      assert(idx < N);
+      m_vals[idx] = std::move(key_val);
+    }
+  }
+
+  value_t get_val(key_t key) {
+    auto &&key_val = m_vals[m_bphf.lookup(key)];
+    if (key == key_val.first) {
+      return key_val.second;
+    }
+    return 0;
+  }
+
+private:
+  boophf_t m_bphf;
+  // We need to store key to check for invalid key
+  std::vector<key_value_t> m_vals;
+};
+
 } // namespace hash_bench
 
 using namespace hash_bench;
 
 int main(int argc, char **argv) {
-  if (argc < 4) {
+  if (argc < 5) {
     std::cout << "Usage:" << argv[0]
-              << " <num entries> <num tasks> <num runs>\n";
+              << " <num entries> <num tasks> <num runs> <0 - bin search, 1 - "
+                 "bbhash>\n";
     return 1;
   }
   size_t num_entries = std::strtoull(argv[1], nullptr, 10);
   size_t num_iters = std::strtoull(argv[2], nullptr, 10);
   size_t num_runs = std::strtoull(argv[3], nullptr, 10);
+  unsigned bench_type = std::strtoull(argv[4], nullptr, 10);
   BenchSet bench_set(RND_SEED);
   bench_set.gen(num_entries);
-  const key_value_t *data = bench_set.data();
   std::vector<hash_bench::key_t> queries = bench_set.make_task(num_iters);
   std::vector<double> results;
-  for (size_t r = 0; r < num_runs; ++r) {
-    auto start = std::chrono::high_resolution_clock::now();
-    for (auto key : queries) {
-      get_val_binsearch(key, data, num_entries);
+
+  // Bench bin search
+  if (bench_type == 0) {
+    const key_value_t *data = bench_set.data();
+    value_t blob = 0;
+    for (size_t r = 0; r < num_runs; ++r) {
+      auto start = std::chrono::high_resolution_clock::now();
+      for (auto key : queries) {
+        blob = blob ^ get_val_binsearch(key, data, num_entries);
+      }
+      auto end = std::chrono::high_resolution_clock::now();
+      auto time =
+          std::chrono::duration_cast<std::chrono::microseconds>(end - start);
+      results.push_back(time.count());
     }
-    auto end = std::chrono::high_resolution_clock::now();
-    auto time =
-        std::chrono::duration_cast<std::chrono::microseconds>(end - start);
-    results.push_back(time.count());
+    std::cout << "Values blob " << blob << "\n";
+    std::cout << "BinSearch ";
+  } else if (bench_type == 1) {
+    // Bench the mphf
+    // lowest bit/elem is achieved with gamma=1, higher values lead to larger
+    // mphf but faster construction/query
+    BBHashMap bbhash_map(num_entries, bench_set, 1.0);
+    value_t blob = 0;
+    for (size_t r = 0; r < num_runs; ++r) {
+      auto start = std::chrono::high_resolution_clock::now();
+      for (auto key : queries) {
+        blob ^= bbhash_map.get_val(key);
+      }
+      auto end = std::chrono::high_resolution_clock::now();
+      auto time =
+          std::chrono::duration_cast<std::chrono::microseconds>(end - start);
+      results.push_back(time.count());
+    }
+    std::cout << "Values blob " << blob << "\n";
+    std::cout << "BBhash ";
   }
   double sum = std::accumulate(results.begin(), results.end(), 0);
-  std::cout << "Binsearch " << sum / results.size() << " us\n";
+  std::cout << sum / results.size() << " us\n";
   return 0;
 }

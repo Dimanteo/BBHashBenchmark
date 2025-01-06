@@ -1,5 +1,5 @@
 CC=g++
-CXXFLAGS=-O2 -MD -g
+CXXFLAGS=-O2 -MD
 CXXFLAGS_DEBUG=-O0 -g
 
 all : hashes.out
